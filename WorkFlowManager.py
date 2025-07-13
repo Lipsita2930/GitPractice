@@ -37,35 +37,39 @@ class WorkflowManager:
         return workflow.compile(checkpointer=MemorySaver())
 
     def retry_or_next(self, current_node, next_node):
-        """Returns a retry logic function that either retries or moves to the next step."""
+    def condition(state: MessagesState) -> Literal[str, END]:
+        attempt_key = f"{current_node}_attempts"
+        attempt_count = state.get(attempt_key, 0)
 
-        def condition(state: MessagesState) -> Literal[str, END]:
-            attempt_key = f"{current_node}_attempts"
-            attempt_count = state.get(attempt_key, 0)
-            last_msg = state['messages'][-1]
+        print(f"[{current_node}] Attempt #{attempt_count + 1}")
+        for i, m in enumerate(state["messages"]):
+            print(f"  Message {i}: {type(m).__name__} - {getattr(m, 'content', '')}")
 
-            print(f"[{current_node}] Attempt #{attempt_count + 1}, Message: {last_msg}")
+        if self.is_success(state):
+            print(f"✅ {current_node} succeeded → moving to {next_node}")
+            return next_node
 
-            if self.is_success(last_msg):
-                return next_node
+        if attempt_count >= self.max_attempts:
+            print(f"❌ {current_node} failed after {self.max_attempts} attempts → END")
+            state["messages"].append(AIMessage(content=f"Step `{current_node}` failed after {self.max_attempts} attempts."))
+            return END
 
-            if attempt_count >= self.max_attempts:
-                state['messages'].append(AIMessage(content=f"Step `{current_node}` failed after {self.max_attempts} attempts. Please revise your prompt."))
-                return END
+        state[attempt_key] = attempt_count + 1
+        print(f"🔁 Retrying {current_node}")
+        return current_node
+    return condition
 
-            state[attempt_key] = attempt_count + 1
-            return current_node
-
-        return condition
-
-    def is_success(self, message):
-        """Determine if a message indicates success."""
-        result = getattr(message, "tool_result", None)
-        if isinstance(message, AIMessage) and message.content:
+    def is_success(self, state: MessagesState):
+    """Check if a successful tool_result or AI response exists."""
+    for msg in reversed(state["messages"]):
+        if hasattr(msg, "tool_result"):
+            result = msg.tool_result
+            if isinstance(result, str) and "error" not in result.lower():
+                return True
+        elif isinstance(msg, AIMessage) and msg.content:
             return True
-        if result and isinstance(result, str) and "error" not in result.lower():
-            return True
-        return False
+    return False
+
 
     def call_snowflake_model(self, state: MessagesState):
         user_msg = state['messages'][-1]
