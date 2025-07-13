@@ -2,15 +2,15 @@ from langgraph.graph import StateGraph, END, START, MessagesState
 from langgraph.prebuilt.tool_node import ToolNode
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import tools_condition
 from typing import Literal
 
 from src.tools import query_snowflake
 from src.llm_manager import LLMManager
 import src.schema_prompt as sp
 
+
 class WorkflowManager:
-    """Manager for creating and running the LangGraph agent workflow."""
+    """LangGraph agent that runs: query → tool → summarization, with retries."""
 
     def __init__(self):
         self.tools = [query_snowflake]
@@ -21,75 +21,72 @@ class WorkflowManager:
     def create_workflow(self):
         workflow = StateGraph(MessagesState)
 
-        # Define nodes
+        # Add nodes
         workflow.add_node("snowflake_query_agent", self.call_snowflake_model)
         workflow.add_node("tools", ToolNode(self.tools))
         workflow.add_node("summary_agent", self.call_summary_model)
 
-        # Define flow
-        workflow.add_edge(START, "snowflake_query_agent")
+        # Entry point
+        workflow.set_entry_point("snowflake_query_agent")
 
-        workflow.add_conditional_edges(
-            "snowflake_query_agent",
-            tools_condition,
-        )
-
-        workflow.add_edge("tools", "snowflake_query_agent")
-
-        workflow.add_conditional_edges(
-            "snowflake_query_agent",
-            self.route_after_agent
-        )
-
-        workflow.add_edge("summary_agent", END)
+        # Define retry transitions
+        workflow.add_conditional_edges("snowflake_query_agent", self.retry_or_next("tools"))
+        workflow.add_conditional_edges("tools", self.retry_or_next("summary_agent"))
+        workflow.add_conditional_edges("summary_agent", self.retry_or_next(END))
 
         return workflow.compile(checkpointer=MemorySaver())
 
-    def is_tool_result_successful(self, message):
+    def retry_or_next(self, next_node):
+        """Returns a retry logic function that either retries or moves to the next step."""
+
+        def condition(state: MessagesState) -> Literal[str, END]:
+            attempt_key = f"{next_node}_attempts"
+            attempt_count = state.get(attempt_key, 0)
+            last_msg = state['messages'][-1]
+
+            if self.is_success(last_msg):
+                return next_node
+
+            if attempt_count >= self.max_attempts:
+                state['messages'].append(AIMessage(content=f"Step `{next_node}` failed after {self.max_attempts} attempts. Please revise your prompt."))
+                return END
+
+            state[attempt_key] = attempt_count + 1
+            return last_msg.name if hasattr(last_msg, 'name') else START  # Retry the same step
+
+        return condition
+
+    def is_success(self, message):
+        """Determine if a message indicates success."""
         result = getattr(message, "tool_result", None)
-        return result and isinstance(result, str) and "error" not in result.lower()
+        if isinstance(message, AIMessage) and message.content:
+            return True
+        if result and isinstance(result, str) and "error" not in result.lower():
+            return True
+        return False
 
     def call_snowflake_model(self, state: MessagesState):
-        user_message = state['messages'][-1]
+        user_msg = state['messages'][-1]
         system_prompt = sp.get_schema_prompt()
-
-        formatted_messages = [
+        response = self.llm_manager.invoke_model([
             SystemMessage(content=system_prompt),
-            user_message
-        ]
-
-        response = self.llm_manager.invoke_model(formatted_messages)
-
-        if not isinstance(response, AIMessage):
-            raise Exception("Expected AIMessage from LLMManager, but got something else.")
-
+            user_msg
+        ])
         return {"messages": [response]}
 
     def call_summary_model(self, state: MessagesState):
-        tool_result = None
-        for msg in reversed(state['messages']):
-            if hasattr(msg, "tool_result") and msg.tool_result:
-                tool_result = msg.tool_result
-                break
+        tool_result = next((msg.tool_result for msg in reversed(state['messages']) if hasattr(msg, "tool_result")), None)
+        if not tool_result:
+            return {"messages": [AIMessage(content="No tool result found to summarize.")]}
 
-        summary_prompt = f"""
-You are a data summarization assistant. Use the tool result below and generate a meaningful natural language summary for visualization:
+        prompt = f"""You are a summarization agent. Use the tool result below and provide a clear, concise summary:
 
 Tool Result:
 {tool_result}
 
-Summary:
-"""
-        formatted_messages = [
-            SystemMessage(content=summary_prompt)
-        ]
+Summary:"""
 
-        response = self.llm_manager.invoke_model(formatted_messages)
-        return {"messages": [response]}
-
-    def call_model(self, state: MessagesState):
-        messages = state['messages']
-        response = self.llm_manager.invoke_model(messages)
+        response = self.llm_manager.invoke_model([SystemMessage(content=prompt)])
         return {"messages": [response]}
 
     def run(self, input_message, thread_id):
@@ -97,20 +94,3 @@ Summary:
             "messages": [HumanMessage(content=input_message)]
         }
         return self.state_graph.invoke(initial_state, config={"configurable": {"thread_id": thread_id}})
-
-    def route_after_agent(self, state: MessagesState) -> Literal["tools", "summary_agent", END]:
-        messages = state['messages']
-        last_message = messages[-1]
-
-        attempt_count = getattr(last_message, 'attempt_count', 0)
-
-        if last_message.tool_calls and not getattr(last_message, 'tool_calls_processed', False):
-            return "tools"
-
-        if self.is_tool_result_successful(last_message):
-            return "summary_agent"
-
-        if attempt_count >= self.max_attempts:
-            return END
-
-        return "tools"
