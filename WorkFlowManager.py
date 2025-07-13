@@ -1,6 +1,6 @@
 from langgraph.graph import StateGraph, END, START, MessagesState
 from langgraph.prebuilt.tool_node import ToolNode
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
 from typing import Literal
 
@@ -70,6 +70,11 @@ class WorkflowManager:
         ]
 
         response = self.llm_manager.invoke_model(formatted_messages)
+
+        # Ensure response is an AIMessage
+        if not isinstance(response, AIMessage):
+            raise Exception("Expected AIMessage from LLMManager, but got something else.")
+
         return {"messages": [response]}
 
     def call_summary_model(self, state: MessagesState):
