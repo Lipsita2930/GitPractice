@@ -20,41 +20,40 @@ class WorkflowManager:
 
     def create_workflow(self):
         workflow = StateGraph(MessagesState)
-
+    
         # Add nodes
         workflow.add_node("snowflake_query_agent", self.call_snowflake_model)
         workflow.add_node("tools", ToolNode(self.tools))
         workflow.add_node("summary_agent", self.call_summary_model)
-
+    
         # Entry point
         workflow.set_entry_point("snowflake_query_agent")
+    
+        # Corrected conditional edges with retry logic
+        workflow.add_conditional_edges("snowflake_query_agent", self.retry_or_next("snowflake_query_agent", "tools"))
+        workflow.add_conditional_edges("tools", self.retry_or_next("tools", "summary_agent"))
+        workflow.add_conditional_edges("summary_agent", self.retry_or_next("summary_agent", END))
 
-        # Define retry transitions
-        workflow.add_conditional_edges("snowflake_query_agent", self.retry_or_next("tools"))
-        workflow.add_conditional_edges("tools", self.retry_or_next("summary_agent"))
-        workflow.add_conditional_edges("summary_agent", self.retry_or_next(END))
+    return workflow.compile(checkpointer=MemorySaver())
 
-        return workflow.compile(checkpointer=MemorySaver())
 
-    def retry_or_next(self, next_node):
-        """Returns a retry logic function that either retries or moves to the next step."""
-
+    def retry_or_next(self, current_node, next_node):
         def condition(state: MessagesState) -> Literal[str, END]:
-            attempt_key = f"{next_node}_attempts"
+            attempt_key = f"{current_node}_attempts"
             attempt_count = state.get(attempt_key, 0)
             last_msg = state['messages'][-1]
-
+    
             if self.is_success(last_msg):
                 return next_node
-
+    
             if attempt_count >= self.max_attempts:
-                state['messages'].append(AIMessage(content=f"Step `{next_node}` failed after {self.max_attempts} attempts. Please revise your prompt."))
+                state['messages'].append(AIMessage(content=f"Step `{current_node}` failed after {self.max_attempts} attempts. Please revise your prompt."))
                 return END
-
+    
             state[attempt_key] = attempt_count + 1
-            return last_msg.name if hasattr(last_msg, 'name') else START  # Retry the same step
-
+            return current_node  # Retry the same node
         return condition
+
 
     def is_success(self, message):
         """Determine if a message indicates success."""
